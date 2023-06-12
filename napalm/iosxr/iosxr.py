@@ -39,6 +39,8 @@ from napalm.base.exceptions import MergeConfigException
 from napalm.base.exceptions import ReplaceConfigException
 from napalm.base.exceptions import CommandTimeoutException
 
+from netutils.interface import canonical_interface_name
+
 logger = logging.getLogger(__name__)
 IP_RIBRoute = "IP_RIBRoute"
 
@@ -2317,6 +2319,113 @@ class IOSXRDriver(NetworkDriver):
             users[username] = user_details
 
         return users
+
+    def get_network_instances(self, name=""):
+        # TODO: Workaround for sending commands
+        def _send_command_postprocess(output):
+            """
+            Cleanup actions on send_command() for NAPALM getters.
+
+            Remove "Load for five sec; one minute if in output"
+            Remove "Time source is"
+            """
+            output = re.sub(r"^Load for five secs.*$", "", output, flags=re.M)
+            output = re.sub(r"^Time source is .*$", "", output, flags=re.M)
+            pattern = r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{2} \d{2}:\d{2}:\d{2}\.\d{3} CEST$"
+
+            output = re.sub(pattern, "", output, flags=re.M)
+
+            return output.strip()
+
+        def _send_command(self, command):
+            """Wrapper for self.device.send.command().
+
+            If command is a list will iterate through commands until valid command.
+            """
+            _netmiko_device = self._netmiko_open(device_type='cisco_xr')
+
+            try:
+                if isinstance(command, list):
+                    for cmd in command:
+                        output = _netmiko_device.send_command(cmd)
+                        if "% Invalid" not in output:
+                            break
+                else:
+                    output = _netmiko_device.send_command(command)
+
+                self._netmiko_close()
+                return _send_command_postprocess(output)
+            except (socket.error, EOFError) as e:
+                self._netmiko_close()
+                raise ConnectionClosedException(str(e))
+
+        instances = {}
+        sh_vrf_detail = _send_command(self=self, command="show vrf all detail")
+        show_ip_int_br = _send_command(self=self, command="show ip interface brief")
+
+        # retrieve all interfaces for the default VRF
+        interface_dict = {}
+        show_ip_int_br = show_ip_int_br.strip()
+
+
+        for line in show_ip_int_br.splitlines():
+            if "Interface " in line:
+                continue
+            interface = line.split()[0]
+            interface_dict[interface] = {}
+
+        instances["default"] = {
+            "name": "default",
+            "type": "DEFAULT_INSTANCE",
+            "state": {"route_distinguisher": ""},
+            "interfaces": {"interface": interface_dict},
+        }
+
+        # No vrf is defined return default one
+        if len(sh_vrf_detail) == 0:
+            if name:
+                raise ValueError("No vrf is setup on router")
+            else:
+                return instances
+
+        if "Invalid input detected" in sh_vrf_detail:
+            # No VRF support
+            return instances
+
+        for vrf in sh_vrf_detail.split("\n\n"):
+            first_part = vrf.split("Address family")[0]
+
+            # retrieve the name of the VRF and the Route Distinguisher
+            vrf_name, RD = re.match(r"^VRF (\S+).*RD (.*);", first_part).groups()
+            if RD == "<not set>":
+                RD = ""
+
+            # retrieve the interfaces of the VRF
+            if_regex = re.match(r".*Interfaces:(.*)", first_part, re.DOTALL)
+            if "No interfaces" in first_part:
+                interfaces = {}
+            else:
+                interfaces = {
+                    canonical_interface_name(itf, {"Vl": "Vlan"}): {}
+                    for itf in if_regex.group(1).split()
+                }
+
+            # remove interfaces in the VRF from the default VRF
+            for item in interfaces:
+                if item in instances["default"]["interfaces"]["interface"]:
+                    del instances["default"]["interfaces"]["interface"][item]
+
+            instances[vrf_name] = {
+                "name": vrf_name,
+                "type": "L3VRF",
+                "state": {"route_distinguisher": RD},
+                "interfaces": {"interface": interfaces},
+            }
+        try:
+            return instances if not name else instances[name]
+        except AttributeError:
+            raise ValueError("The vrf %s does not exist" % name)
+
 
     def get_config(self, retrieve="all", full=False, sanitized=False):
         config = {"startup": "", "running": "", "candidate": ""}  # default values
